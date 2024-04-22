@@ -99,7 +99,7 @@ def preprocess_dataset(dataset_path, tokenizer):
     )
     
 
-def main(reward_config, model_config):
+def main(reward_config, model_config, args):
     reward_config.gradient_checkpointing_kwargs = dict(use_reentrant=False)
 
     model, tokenizer = get_model_tokenizer(model_config)
@@ -121,6 +121,6 @@ def main(reward_config, model_config):
 
 if __name__ == "__main__":
     parser = HfArgumentParser((RewardConfig, ModelConfig))
-    reward_config, model_config, args = parser.parse_args_into_dataclasses()
+    reward_config, model_config, args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     
     main(reward_config, model_config, args)
