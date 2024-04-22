@@ -1,3 +1,4 @@
+*.ipynb
 benchmark/trl
 *.bak
 .gitattributes
