@@ -15,16 +15,32 @@
 import warnings
 
 import torch
+import os
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, HfArgumentParser
+from dataclasses import dataclass, field
+from typing import Dict
+import numpy as np
 
-from trl import ModelConfig, RewardConfig, RewardTrainer, get_kbit_device_map, get_quantization_config
+from trl import ModelConfig, RewardConfig, RewardTrainer, get_kbit_device_map, get_peft_config, get_quantization_config
 
 tqdm.pandas()
 
+DEBUG = os.getenv("DEBUG", False)
 
+@dataclass
+class DataConfig:
+    train_file: str = field(
+        metadata={"help": "Path to the training dataset file."}
+    )
+    eval_file: str = field(
+        metadata={"help": "Path to the evaluation dataset file."}
+    )
 
+def compute_metrics():
+    # reward_chosen
+    # reward_rejected
 
 def get_model_tokenizer(model_config):
     torch_dtype = (
@@ -38,11 +54,18 @@ def get_model_tokenizer(model_config):
         trust_remote_code=model_config.trust_remote_code,
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
+        torch_dtype=torch_dtype
     )
     tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, use_fast=True)
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_config.model_name_or_path, num_labels=1, **model_kwargs
+        model_config.model_name_or_path, 
+        num_labels=1, 
+        attn_implementation="flash_attention_2",
+        **model_kwargs
     )
+    # this was key to avoid OOM errors
+    # https://github.com/huggingface/transformers/pull/24247
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
 
     if model_config.lora_task_type != "SEQ_CLS":
         warnings.warn(
@@ -59,7 +82,7 @@ def apply_template_mistral_instruct(system, instruction, response):
 
 
 def preprocess_dataset(dataset_path, tokenizer):
-    raw_datasets = load_dataset(dataset_path)
+    raw_datasets = load_dataset('json', data_files=dataset_path)
     
     # Tokenize chosen/rejected pairs of inputs
     # Adapt this section to your needs for custom datasets
@@ -70,10 +93,7 @@ def preprocess_dataset(dataset_path, tokenizer):
             "input_ids_rejected": [],
             "attention_mask_rejected": [],
         }
-        system = examples["system"]
-        instruction = examples["instruction"]
-        output = examples["output"]
-        for chosen, rejected in zip(output["chosen"], output["rejected"]):
+        for system, instruction, chosen, rejected in zip(examples["system"], examples["instruction"], examples["chosen"], examples["rejected"]):
             tokenized_chosen = tokenizer(
                 apply_template_mistral_instruct(system, instruction, chosen), 
                 truncation=True, 
@@ -96,23 +116,34 @@ def preprocess_dataset(dataset_path, tokenizer):
         preprocess_function,
         batched=True,
         num_proc=4,
-    )
+    )["train"]
     
-
-def main(reward_config, model_config, args):
+# log error, 다른 거에 wrapping
+def main(reward_config, model_config, data_config):
     reward_config.gradient_checkpointing_kwargs = dict(use_reentrant=False)
+    
+    # print(os.getenv("CUDA_VISIBLE_DEVICES"))
 
     model, tokenizer = get_model_tokenizer(model_config)
-    train_dataset = preprocess_dataset(args.train_file, tokenizer)
-    eval_dataset = preprocess_dataset(args.eval_file, tokenizer)
+    # https://github.com/huggingface/trl/issues/937#issuecomment-1793697802
+    tokenizer.padding_side = "right"
+    model.config.pad_token_id = tokenizer.pad_token_id
     
+    train_dataset = preprocess_dataset(data_config.train_file, tokenizer)
+    eval_dataset = preprocess_dataset(data_config.eval_file, tokenizer)
     
+    # print("Number of parameters in the model:")
+    # print(model.num_parameters())
+    # print("Number of trainable parameters in the model:")
+    # print(model.num_parameters(only_trainable=True))
+        
     trainer = RewardTrainer(
         model=model,
         tokenizer=tokenizer,
         args=reward_config,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset
+        eval_dataset=eval_dataset,
+        # peft_config=get_peft_config(model_config)
     )
     trainer.train()
     trainer.save_model(reward_config.output_dir)
@@ -120,7 +151,7 @@ def main(reward_config, model_config, args):
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((RewardConfig, ModelConfig))
-    reward_config, model_config, args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+    parser = HfArgumentParser((RewardConfig, ModelConfig, DataConfig))
+    reward_config, model_config, data_config = parser.parse_args_into_dataclasses()
     
-    main(reward_config, model_config, args)
+    main(reward_config, model_config, data_config)
