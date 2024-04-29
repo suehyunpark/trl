@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Dict
 import numpy as np
 
-from trl import ModelConfig, RewardConfig, RewardTrainer, get_kbit_device_map, get_peft_config, get_quantization_config
+from trl import ModelConfig, RewardConfig, RewardTrainer, get_kbit_device_map, get_quantization_config
 
 tqdm.pandas()
 
@@ -38,9 +38,6 @@ class DataConfig:
         metadata={"help": "Path to the evaluation dataset file."}
     )
 
-def compute_metrics():
-    # reward_chosen
-    # reward_rejected
 
 def get_model_tokenizer(model_config):
     torch_dtype = (
@@ -76,13 +73,13 @@ def get_model_tokenizer(model_config):
     return model, tokenizer
 
 
-def apply_template_mistral_instruct(system, instruction, response):
-    prompt = f"{system}\n{instruction}".strip()
-    return f"[INST] {prompt} [/INST] {response}"
-
-
-def preprocess_dataset(dataset_path, tokenizer):
+def preprocess_dataset(dataset_path, reward_config, tokenizer):
     raw_datasets = load_dataset('json', data_files=dataset_path)
+    
+    def apply_template(system, instruction, response):
+        # Mistral template
+        prompt = f"{system}\n{instruction}".strip()
+        return f"[INST] {prompt} [/INST] {response}"
     
     # Tokenize chosen/rejected pairs of inputs
     # Adapt this section to your needs for custom datasets
@@ -95,14 +92,14 @@ def preprocess_dataset(dataset_path, tokenizer):
         }
         for system, instruction, chosen, rejected in zip(examples["system"], examples["instruction"], examples["chosen"], examples["rejected"]):
             tokenized_chosen = tokenizer(
-                apply_template_mistral_instruct(system, instruction, chosen), 
-                truncation=True, 
-                max_length=reward_config.max_length
+                apply_template(system, instruction, chosen), 
+                # truncation=True, 
+                # max_length=reward_config.max_length
             )
             tokenized_rejected = tokenizer(
-                apply_template_mistral_instruct(system, instruction, rejected), 
-                truncation=True, 
-                max_length=reward_config.max_length
+                apply_template(system, instruction, rejected), 
+                # truncation=True, 
+                # max_length=reward_config.max_length
             )
 
             new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
@@ -112,11 +109,23 @@ def preprocess_dataset(dataset_path, tokenizer):
 
         return new_examples
 
-    return raw_datasets.map(
+    preprocessed_dataset = raw_datasets.map(
         preprocess_function,
         batched=True,
-        num_proc=4,
+        num_proc=8,
     )["train"]
+    
+    # https://github.com/huggingface/trl/issues/1473#issuecomment-2078495703
+    # When the prompt exceeds the max_length, the log probabilities for both chosen and rejected turn to NaN. 
+    # Consider filtering out cases where the prompt is longer than the max_length or max_prompt_len. 
+    # The reason for trimming cases where the prompt exceeds max_prompt_len is that 
+    # if the chosen or rejected segments are significantly shorter than the prompt, it may hinder effective learning.
+    preprocessed_dataset = preprocessed_dataset.filter(
+        lambda x: len(x["input_ids_chosen"]) <= reward_config.max_length
+        and len(x["input_ids_rejected"]) <= reward_config.max_length
+    )
+    
+    return preprocessed_dataset
     
 # log error, 다른 거에 wrapping
 def main(reward_config, model_config, data_config):
@@ -129,8 +138,8 @@ def main(reward_config, model_config, data_config):
     tokenizer.padding_side = "right"
     model.config.pad_token_id = tokenizer.pad_token_id
     
-    train_dataset = preprocess_dataset(data_config.train_file, tokenizer)
-    eval_dataset = preprocess_dataset(data_config.eval_file, tokenizer)
+    train_dataset = preprocess_dataset(data_config.train_file, reward_config, tokenizer)
+    eval_dataset = preprocess_dataset(data_config.eval_file, reward_config, tokenizer)
     
     # print("Number of parameters in the model:")
     # print(model.num_parameters())
@@ -142,8 +151,7 @@ def main(reward_config, model_config, data_config):
         tokenizer=tokenizer,
         args=reward_config,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        # peft_config=get_peft_config(model_config)
+        eval_dataset=eval_dataset
     )
     trainer.train()
     trainer.save_model(reward_config.output_dir)
