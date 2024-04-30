@@ -18,6 +18,7 @@ python examples/scripts/ppo.py \
 from dataclasses import dataclass, field
 from typing import Optional
 
+import os
 import torch
 from accelerate import Accelerator
 from datasets import load_dataset
@@ -35,14 +36,17 @@ tqdm.pandas()
 
 @dataclass
 class DataConfig:
+    output_dir: str = field(
+        metadata={"help": "The output directory where the model predictions and checkpoints will be written."}
+    )
     max_length: str = field(
         metadata={"help": "Maximum length of the input sequence."}
     )
-    eval_file: str = field(
-        metadata={"help": "Path to the evaluation dataset file."}
+    repo_id: str = field(
+        metadata={"help": "ID of the repository."}
     )
-    eval_steps: Optional[int] = field(
-        metadata={"help": "Number of evaluation steps."}
+    run_name: str = field(
+        metadata={"help": "Run name of wandb"}
     )
 
 def preprocess_dataset(ppo_config, tokenizer, data_config):
@@ -88,6 +92,8 @@ def preprocess_dataset(ppo_config, tokenizer, data_config):
 
 
 def main(ppo_config, data_config):
+    ppo_config.tracker_kwargs = {"wandb": {"project": os.getenv("WANDB_PROJECT"), "entity": os.getenv("WANDB_ENTITY"), "name": data_config.run_name}}
+    ppo_config.push_to_hub_if_best_kwargs = {"repo_id": data_config.repo_id, "private": True}
     set_seed(ppo_config.seed)
     
     reward_model = AutoModelForSequenceClassification.from_pretrained(ppo_config.reward_model_name, num_labels=1)
@@ -130,7 +136,7 @@ def main(ppo_config, data_config):
     for steps, batch in tqdm(enumerate(ppo_trainer.dataloader)):
         query_tensors = batch["input_ids"]
         
-        # Get response from gpt2
+        # Get response
         response_tensors, ref_response_tensors = ppo_trainer.generate(
             query_tensors, 
             return_prompt=False, 
@@ -169,6 +175,9 @@ def main(ppo_config, data_config):
             rewards,
             columns_to_log=["query", "response", "ref_response", "rewards", "ref_rewards"]
         )
+
+        # if steps % ppo_config.save_steps == 0:
+        #     ppo_trainer.save_model(data_config.output_dir)
 
 
 if __name__ == "__main__":

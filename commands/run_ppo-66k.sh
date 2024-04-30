@@ -16,7 +16,7 @@ export HF_TOKEN="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"
 export WANDB_PROJECT="mpa-rm"
 export WANDB_ENTITY="suehyun"
 
-# OUTPUT_DIR="outputs/"
+OUTPUT_DIR="outputs/mpa-Mistral-7b-v0.2-hf-ppo-66k"
 MODEL_NAME="/mnt/nas/suehyun/axolotl/outputs/mpa/mpa-Mistral-7b-v0.2-hf-sft-epoch1"
 REWARD_MODEL_NAME="kaist-ai/mpa-Mistral-7b-v0.2-hf-rm-66k"
 TRAIN_FILE="/mnt/nas/suehyun/MPA/data/train/preferences_v1_responses_for_orpo_64k_v2_ppo.jsonl"
@@ -36,8 +36,9 @@ RUN_NAME="mpa-Mistral-7b-v0.2-hf-ppo-66k"
 EXTRA_ACCELERATE_ARGS="--config_file examples/accelerate_configs/deepspeed_zero2.yaml"
 
 DATA_CONFIG_ARGS = """--max_length $SEQ_LEN \
-  --eval_file $EVAL_FILE \
-  --eval_steps 100
+  --repo_id $HUB_MODEL_ID \
+  --run_name $RUN_NAME \
+  --output_dir $OUTPUT_DIR \
 """
 
 PPO_CONFIG_ARGS="""--exp_name $RUN_NAME \
@@ -47,13 +48,13 @@ PPO_CONFIG_ARGS="""--exp_name $RUN_NAME \
   --reward_model $REWARD_MODEL_NAME \
   --query_dataset $TRAIN_FILE \
   --remove_unused_columns True \
-  --tracker_kwargs='{"wandb": {"entity": $WANDB_ENTITY, "name": $RUN_NAME, "project": $WANDB_PROJECT}}' \
-  --push_to_hub_if_best_kwargs='{"repo_name": $HUB_MODEL_ID, "organization": "kaist-ai"}' \
   --learning_rate $LR \
   --batch_size $BATCH_SIZE \
   --mini_batch_size $BATCH_SIZE \
   --gradient_accumulation_steps 1 \
-  --ppo_epochs $EPOCHS"""
+  --ppo_epochs $EPOCHS \
+  --optimize_device_cache True \
+  --tracker_project_name $WANDB_PROJECT """
 
 
 srun accelerate launch $EXTRA_ACCELERATE_ARGS \

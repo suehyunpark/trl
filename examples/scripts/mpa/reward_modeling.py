@@ -20,10 +20,14 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, HfArgumentParser
 from dataclasses import dataclass, field
-from typing import Dict
 import numpy as np
+from typing import Dict
+from scipy import stats
+import traceback
+import sys
+import wandb
 
-from trl import ModelConfig, RewardConfig, RewardTrainer, get_kbit_device_map, get_quantization_config
+from trl import ModelConfig, RewardConfig, RewardTrainer, set_seed, get_kbit_device_map, get_quantization_config
 
 tqdm.pandas()
 
@@ -37,6 +41,34 @@ class DataConfig:
     eval_file: str = field(
         metadata={"help": "Path to the evaluation dataset file."}
     )
+    
+# trl/trainer/utils.py#L548-L549
+def compute_metrics(eval_pred) -> Dict[str, float]:
+    predictions, labels = eval_pred
+    # Here, predictions is rewards_chosen and rewards_rejected.
+    # We want to see how much of the time rewards_chosen > rewards_rejected.
+    if np.array(predictions[:, 0] == predictions[:, 1], dtype=float).sum() > 0:
+        warnings.warn(
+            f"There are {np.array(predictions[:, 0] == predictions[:, 1]).sum()} out of {len(predictions[:, 0])} instances where the predictions for both options are equal. As a consequence the accuracy can be misleading."
+        )
+    rewards_chosen_stats = stats.describe(predictions[:, 0])
+    rewards_rejected_stats = stats.describe(predictions[:, 1])
+    
+    rewards_chosen_mean = rewards_chosen_stats.mean
+    rewards_rejected_mean = rewards_rejected_stats.mean
+    rewards_chosen_std = rewards_chosen_stats.variance ** 0.5
+    rewards_rejected_std = rewards_rejected_stats.variance ** 0.5
+
+    predictions = np.argmax(predictions, axis=1)
+    accuracy = np.array(predictions == labels, dtype=float).mean().item()
+    
+    return {
+        "accuracy": accuracy, 
+        "rewards_chosen_mean": rewards_chosen_mean, 
+        "rewards_rejected_mean": rewards_rejected_mean,
+        "rewards_chosen_std": rewards_chosen_std,
+        "rewards_rejected_std": rewards_rejected_std
+    }
 
 
 def get_model_tokenizer(model_config):
@@ -112,7 +144,7 @@ def preprocess_dataset(dataset_path, reward_config, tokenizer):
     preprocessed_dataset = raw_datasets.map(
         preprocess_function,
         batched=True,
-        num_proc=8,
+        num_proc=24,
     )["train"]
     
     # https://github.com/huggingface/trl/issues/1473#issuecomment-2078495703
@@ -127,11 +159,10 @@ def preprocess_dataset(dataset_path, reward_config, tokenizer):
     
     return preprocessed_dataset
     
-# log error, 다른 거에 wrapping
 def main(reward_config, model_config, data_config):
     reward_config.gradient_checkpointing_kwargs = dict(use_reentrant=False)
     
-    # print(os.getenv("CUDA_VISIBLE_DEVICES"))
+    print(os.getenv("CUDA_VISIBLE_DEVICES"))
 
     model, tokenizer = get_model_tokenizer(model_config)
     # https://github.com/huggingface/trl/issues/937#issuecomment-1793697802
@@ -151,15 +182,20 @@ def main(reward_config, model_config, data_config):
         tokenizer=tokenizer,
         args=reward_config,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset
+        eval_dataset=eval_dataset,
+        compute_metrics=compute_metrics
     )
-    trainer.train()
-    trainer.save_model(reward_config.output_dir)
-
+    
+    try:
+        trainer.train()
+        trainer.save_model(reward_config.output_dir)
+    except Exception as e:
+        print(traceback.print_exc(), file=sys.stderr)
 
 
 if __name__ == "__main__":
     parser = HfArgumentParser((RewardConfig, ModelConfig, DataConfig))
     reward_config, model_config, data_config = parser.parse_args_into_dataclasses()
     
+    set_seed(reward_config.seed)
     main(reward_config, model_config, data_config)
