@@ -16,20 +16,17 @@ python examples/scripts/ppo.py \
     --log_with=wandb
 """
 from dataclasses import dataclass, field
-from typing import Optional
 
-import os
 import torch
-from accelerate import Accelerator
 from datasets import load_dataset
-from peft import LoraConfig
 from tqdm import tqdm
-from transformers import AutoTokenizer, HfArgumentParser, DataCollatorWithPadding
+import bitsandbytes as bnb
+from transformers import HfArgumentParser, AutoModelForSequenceClassification
 
-from trl import AutoModelForCausalLMWithValueHead, AutoModelForSequenceClassification, PPOConfig, PPOTrainer, set_seed
+from trl import AutoModelForCausalLMWithValueHead, PPOConfig, ModelConfig, PPOTrainer, set_seed
 from trl.core import LengthSampler
-from trl.import_utils import is_npu_available, is_xpu_available
 
+from get_module import get_model, get_tokenizer
 
 tqdm.pandas()
 
@@ -39,7 +36,7 @@ class DataConfig:
     output_dir: str = field(
         metadata={"help": "The output directory where the model predictions and checkpoints will be written."}
     )
-    max_length: str = field(
+    max_length: int = field(
         metadata={"help": "Maximum length of the input sequence."}
     )
     repo_id: str = field(
@@ -47,6 +44,9 @@ class DataConfig:
     )
     run_name: str = field(
         metadata={"help": "Run name of wandb"}
+    )
+    save_steps: int = field(
+        metadata={"help": "Number of steps to save the model."}
     )
 
 def preprocess_dataset(ppo_config, tokenizer, data_config):
@@ -65,7 +65,7 @@ def preprocess_dataset(ppo_config, tokenizer, data_config):
         }
         for system, instruction in zip(examples["system"], examples["instruction"]):
             query = apply_template(system, instruction)
-            tokenized_query = tokenizer(query)
+            tokenized_query = tokenizer(query, max_length=data_config.max_length, truncation=True)
 
             new_examples["query"].append(query)
             new_examples["input_ids"].append(tokenized_query["input_ids"])
@@ -90,38 +90,42 @@ def preprocess_dataset(ppo_config, tokenizer, data_config):
     
     return preprocessed_dataset
 
+# mini batch size 1 for each generation
+def collator(data):
+    return {key: [d[key] for d in data] for key in data[0]}
 
-def main(ppo_config, data_config):
-    ppo_config.tracker_kwargs = {"wandb": {"project": os.getenv("WANDB_PROJECT"), "entity": os.getenv("WANDB_ENTITY"), "name": data_config.run_name}}
+def main(ppo_config, model_config, data_config):
+    ppo_config.tracker_kwargs = {"wandb": {"name": data_config.run_name}}
     ppo_config.push_to_hub_if_best_kwargs = {"repo_id": data_config.repo_id, "private": True}
     set_seed(ppo_config.seed)
     
-    reward_model = AutoModelForSequenceClassification.from_pretrained(ppo_config.reward_model_name, num_labels=1)
-    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        ppo_config.model_name, 
-        trust_remote_code=ppo_config.trust_remote_code,
-        attn_implementation="flash_attention_2")
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        ppo_config.model_name, 
-        trust_remote_code=ppo_config.trust_remote_code,
-        attn_implementation="flash_attention_2")
+    model = get_model(model_config, AutoModelForCausalLMWithValueHead)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
     
-    tokenizer = AutoTokenizer.from_pretrained(ppo_config.model_name)
+    tokenizer = get_tokenizer(model_config)
     # https://github.com/huggingface/trl/issues/937#issuecomment-1793697802
     tokenizer.padding_side = "right"
     model.config.pad_token_id = tokenizer.pad_token_id
     
-    train_dataset = preprocess_dataset(ppo_config, tokenizer, data_config.max_length)
+    ref_model = get_model(model_config, AutoModelForCausalLMWithValueHead)
     
+    train_dataset = preprocess_dataset(ppo_config, tokenizer, data_config)
+    
+    adam = bnb.optim.Adam8bit(model.parameters(), lr=ppo_config.learning_rate)
+
     ppo_trainer = PPOTrainer(
         ppo_config, 
         model, 
         ref_model, 
         tokenizer, 
         dataset=train_dataset,
-        data_collator=DataCollatorWithPadding(tokenizer),
+        data_collator=collator,
+        optimizer=adam
     )
+    
+    # `.to` is not supported for `4-bit` or `8-bit` bitsandbytes models. Please use the model as it is, since the model has already been set to the correct devices and casted to the correct `dtype`.
+    model_config.model_name_or_path = ppo_config.reward_model
+    reward_model = get_model(model_config, AutoModelForSequenceClassification, num_labels=1)
     
     # We then define the arguments to pass to the `generate` function. These arguments
     # are passed to the `generate` function of the PPOTrainer, which is a wrapper around
@@ -132,15 +136,19 @@ def main(ppo_config, data_config):
         "do_sample": True,
         "pad_token_id": tokenizer.pad_token_id,
     }
+    output_length_sampler = LengthSampler(32, data_config.max_length)
     
     for steps, batch in tqdm(enumerate(ppo_trainer.dataloader)):
         query_tensors = batch["input_ids"]
-        
+        # https://discuss.huggingface.co/t/dataset-map-return-only-list-instead-torch-tensors/15767
+        # https://github.com/huggingface/trl/issues/787#issuecomment-1937917675
+        query_tensors = [torch.LongTensor(query_tensor) for query_tensor in query_tensors]
         # Get response
         response_tensors, ref_response_tensors = ppo_trainer.generate(
             query_tensors, 
             return_prompt=False, 
             generate_ref_response=True, 
+            length_sampler=output_length_sampler,
             **generation_kwargs
         )
         batch["response"] = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
@@ -176,13 +184,15 @@ def main(ppo_config, data_config):
             columns_to_log=["query", "response", "ref_response", "rewards", "ref_rewards"]
         )
 
-        # if steps % ppo_config.save_steps == 0:
-        #     ppo_trainer.save_model(data_config.output_dir)
+        if steps % ppo_config.save_steps == 0:
+            ppo_trainer.save_model(data_config.output_dir)
+            
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((PPOConfig, DataConfig))
-    ppo_config, data_config = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((PPOConfig, ModelConfig, DataConfig))
+    ppo_config, model_config, data_config = parser.parse_args_into_dataclasses()
     
-    main(ppo_config, data_config)
+    main(ppo_config, model_config, data_config)
     

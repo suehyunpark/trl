@@ -28,6 +28,7 @@ import sys
 import wandb
 
 from trl import ModelConfig, RewardConfig, RewardTrainer, set_seed, get_kbit_device_map, get_quantization_config
+from get_module import get_model, get_tokenizer
 
 tqdm.pandas()
 
@@ -71,38 +72,38 @@ def compute_metrics(eval_pred) -> Dict[str, float]:
     }
 
 
-def get_model_tokenizer(model_config):
-    torch_dtype = (
-        model_config.torch_dtype
-        if model_config.torch_dtype in ["auto", None]
-        else getattr(torch, model_config.torch_dtype)
-    )
-    quantization_config = get_quantization_config(model_config)
-    model_kwargs = dict(
-        revision=model_config.model_revision,
-        trust_remote_code=model_config.trust_remote_code,
-        device_map=get_kbit_device_map() if quantization_config is not None else None,
-        quantization_config=quantization_config,
-        torch_dtype=torch_dtype
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, use_fast=True)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_config.model_name_or_path, 
-        num_labels=1, 
-        attn_implementation="flash_attention_2",
-        **model_kwargs
-    )
-    # this was key to avoid OOM errors
-    # https://github.com/huggingface/transformers/pull/24247
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
+# def get_model_tokenizer(model_config):
+#     torch_dtype = (
+#         model_config.torch_dtype
+#         if model_config.torch_dtype in ["auto", None]
+#         else getattr(torch, model_config.torch_dtype)
+#     )
+#     quantization_config = get_quantization_config(model_config)
+#     model_kwargs = dict(
+#         revision=model_config.model_revision,
+#         trust_remote_code=model_config.trust_remote_code,
+#         device_map=get_kbit_device_map() if quantization_config is not None else None,
+#         quantization_config=quantization_config,
+#         attn_implementation=model_config.attn_implementation,
+#         torch_dtype=torch_dtype
+#     )
+#     tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, use_fast=True)
+#     model = AutoModelForSequenceClassification.from_pretrained(
+#         model_config.model_name_or_path, 
+#         num_labels=1, 
+#         **model_kwargs
+#     )
+#     # this was key to avoid OOM errors
+#     # https://github.com/huggingface/transformers/pull/24247
+#     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
 
-    if model_config.lora_task_type != "SEQ_CLS":
-        warnings.warn(
-            "You are using a `task_type` that is different than `SEQ_CLS` for PEFT. This will lead to silent bugs"
-            " Make sure to pass --lora_task_type SEQ_CLS when using this script."
-        )
+#     if model_config.lora_task_type != "SEQ_CLS":
+#         warnings.warn(
+#             "You are using a `task_type` that is different than `SEQ_CLS` for PEFT. This will lead to silent bugs"
+#             " Make sure to pass --lora_task_type SEQ_CLS when using this script."
+#         )
         
-    return model, tokenizer
+#     return model, tokenizer
 
 
 def preprocess_dataset(dataset_path, reward_config, tokenizer):
@@ -164,7 +165,10 @@ def main(reward_config, model_config, data_config):
     
     print(os.getenv("CUDA_VISIBLE_DEVICES"))
 
-    model, tokenizer = get_model_tokenizer(model_config)
+    model = get_model(model_config, AutoModelForSequenceClassification, num_labels=1)
+    tokenizer = get_tokenizer(model_config)
+    # model, tokenizer = get_model_tokenizer(model_config)
+    
     # https://github.com/huggingface/trl/issues/937#issuecomment-1793697802
     tokenizer.padding_side = "right"
     model.config.pad_token_id = tokenizer.pad_token_id

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=mpa-Mistral-7b-v0.2-hf-rm-66k     # Job name
+#SBATCH --job-name=mpa-Mistral-7b-v0.2-hf-ppo-66k     # Job name
 #SBATCH -o /mnt/nas/suehyun/trl/logs/out_%x.txt              # Path to output log file (%j expands to job name)
 #SBATCH -e /mnt/nas/suehyun/trl/logs/err_%x.err              # Path to error log file (%j expands to job name)
 #SBATCH --partition=LocalQ         # Partition name
@@ -21,65 +21,51 @@ export NCCL_IB_GID_INDEX=3
 # https://github.com/huggingface/accelerate/issues/314#issuecomment-1565259831
 export NCCL_P2P_LEVEL=NVL
 
-OUTPUT_DIR="outputs/"
+OUTPUT_DIR="outputs/mpa-Mistral-7b-v0.2-hf-ppo-66k"
 MODEL_NAME="/mnt/nas/suehyun/axolotl/outputs/mpa/mpa-Mistral-7b-v0.2-hf-sft-epoch1"
+REWARD_MODEL_NAME="kaist-ai/mpa-Mistral-7b-v0.2-hf-rm-66k"
 TRAIN_FILE="/mnt/nas/suehyun/MPA/data/train/preferences_v1_responses_for_orpo_64k_v2_ppo.jsonl"
 EVAL_FILE="/mnt/nas/suehyun/MPA/data/test/mpa_rm_test_set_w_rubric_per_preference.json"
-EPOCHS=1
+EPOCHS=3
 BATCH_SIZE=4
 SEQ_LEN=4096
 # LR="2e-5"
-LR="9e-6"
+LR="1.41e-5"  # InstructGPT
 
-HUB_MODEL_ID="kaist-ai/mpa-Mistral-7b-v0.2-hf-rm-66k"
-RUN_NAME="mpa-Mistral-7b-v0.2-hf-rm-66k"
+HUB_MODEL_ID="kaist-ai/mpa-Mistral-7b-v0.2-hf-ppo-66k"
+RUN_NAME="mpa-Mistral-7b-v0.2-hf-ppo-66k"
 
 
 # Handle extra arguments in case one passes accelerate configs.
 # EXTRA_ACCELERATE_ARGS="--config_file examples/accelerate_configs/multi_gpu_slurm.yaml"
 EXTRA_ACCELERATE_ARGS="--config_file examples/accelerate_configs/deepspeed_zero2.yaml"
 
-MODEL_CONFIG_ARGS="""--model_name_or_path $MODEL_NAME \
-  --torch_dtype float16
-"""
-#   --load_in_8bit=True \
-#   --use_peft=True \
-#   --lora_task_type="SEQ_CLS" \
-#   --lora_r 8 \
-#   --lora_alpha 32 \
-#   --lora_dropout 0.1
-# """
-
-REWARD_CONFIG_ARGS="""--output_dir $OUTPUT_DIR \
-  --num_train_epochs $EPOCHS \
-  --per_device_train_batch_size $BATCH_SIZE \
-  --max_length $SEQ_LEN \
-  --learning_rate $LR \
-  --gradient_accumulation_steps=1 \
-  --gradient_checkpointing=True \
-  --logging_steps 1 \
-  --evaluation_strategy "steps" \
-  --eval_steps 100 \
-  --save_steps 100 \
-  --save_total_limit 1 \
-  --metric_for_best_model accuracy \
-  --load_best_model_at_end \
-  --optim adamw_torch \
-  --lr_scheduler_type cosine \
-  --warmup_steps 10 \
-  --report_to="wandb" \
-  --push_to_hub \
-  --hub_model_id $HUB_MODEL_ID \
-  --hub_private_repo \
-  --hub_strategy checkpoint \
+DATA_CONFIG_ARGS = """--max_length $SEQ_LEN \
+  --repo_id $HUB_MODEL_ID \
   --run_name $RUN_NAME \
-  --fp16=True"""
+  --output_dir $OUTPUT_DIR \
+  --save_steps 500
+"""
+
+PPO_CONFIG_ARGS="""--exp_name $RUN_NAME \
+  --seed 42 \
+  --log_with wandb \
+  --model_name $MODEL_NAME \
+  --reward_model $REWARD_MODEL_NAME \
+  --query_dataset $TRAIN_FILE \
+  --remove_unused_columns True \
+  --learning_rate $LR \
+  --batch_size $BATCH_SIZE \
+  --mini_batch_size $BATCH_SIZE \
+  --gradient_accumulation_steps 1 \
+  --ppo_epochs $EPOCHS \
+  --optimize_device_cache True \
+  --tracker_project_name $WANDB_PROJECT \
+  --trust_remote_code True"""
 
 
 srun accelerate launch $EXTRA_ACCELERATE_ARGS \
-    examples/scripts/mpa/reward_modeling.py \
-    --train_file $TRAIN_FILE \
-    --eval_file $EVAL_FILE \
-    $MODEL_CONFIG_ARGS \
-    $REWARD_CONFIG_ARGS
+    examples/scripts/mpa/ppo.py \
+    $DATA_CONFIG_ARGS \
+    $PPO_CONFIG_ARGS
     

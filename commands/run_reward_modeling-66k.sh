@@ -6,10 +6,12 @@ export HF_TOKEN="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"
 export WANDB_PROJECT="mpa-rm"
 export WANDB_ENTITY="suehyun"
 
+# https://github.com/ultralytics/ultralytics/issues/1439#issuecomment-1821973338
 export NCCL_IB_GID_INDEX=3
+# https://github.com/huggingface/accelerate/issues/314#issuecomment-1565259831
 export NCCL_P2P_LEVEL=NVL
 
-OUTPUT_DIR="outputs/"
+OUTPUT_DIR="outputs/mpa-Mistral-7b-v0.2-hf-rm-66k"
 MODEL_NAME="kaist-ai/mpa-Mistral-7b-v0.2-hf-sft-epoch1"
 TRAIN_FILE="/data/suehyun/MPA/data/train/preferences_v1_responses_for_orpo_64k_v2_ppo.jsonl"
 EVAL_FILE="/data/suehyun/MPA/data/test/mpa_rm_test_set_w_rubric_per_preference.json"
@@ -26,10 +28,10 @@ RUN_NAME="mpa-Mistral-7b-v0.2-hf-rm-66k"
 # Handle extra arguments in case one passes accelerate configs.
 # EXTRA_ACCELERATE_ARGS="--config_file examples/accelerate_configs/multi_gpu_slurm.yaml"
 EXTRA_ACCELERATE_ARGS="--config_file examples/accelerate_configs/deepspeed_zero2.yaml"
-CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 MODEL_CONFIG_ARGS="""--model_name_or_path $MODEL_NAME \
-  --torch_dtype float16
+  --torch_dtype float16 \
+  --attn_implementation flash_attention_2
 """
 #   --load_in_8bit=True \
 #   --use_peft=True \
@@ -69,5 +71,4 @@ CUDA_VISIBLE_DEVICES="4,5,6,7" accelerate launch $EXTRA_ACCELERATE_ARGS \
     --train_file $TRAIN_FILE \
     --eval_file $EVAL_FILE \
     $MODEL_CONFIG_ARGS \
-    $REWARD_CONFIG_ARGS
-    
+    $REWARD_CONFIG_ARGS \
